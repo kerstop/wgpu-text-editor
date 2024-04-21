@@ -1,12 +1,82 @@
-pub trait Widget {
-    fn render(&self, pass: &mut wgpu::RenderPass);
+use std::sync::OnceLock;
 
+use crate::{math::Vertex, RenderContext};
+use bytemuck::bytes_of;
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu::{Buffer, BufferUsages, RenderPass};
+
+const RECT_VERTEX_COUNT: u32 = 4;
+const RECT_INDEX_COUNT: u32 = 6;
+static RECT_INDEX_BUFFER: OnceLock<Buffer> = OnceLock::new();
+
+pub struct Rect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    vertex_buffer: Buffer,
 }
 
-pub struct Button;
+impl Rect {
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        render_context: &mut RenderContext,
+    ) -> Self {
+        let z = 0.0;
+        let points = [
+            Vertex {
+                position: [x, y, z],
+            },
+            Vertex {
+                position: [x + width, y, z],
+            },
+            Vertex {
+                position: [x + width, y + height, z],
+            },
+            Vertex {
+                position: [x, y + height, z],
+            },
+        ];
 
-impl Widget for Button {
-    fn render(&self, pass: &mut wgpu::RenderPass) {
-        //pass.draw
+        let vertex_buffer = render_context
+            .device
+            .create_buffer_init(&BufferInitDescriptor {
+                label: None,
+                contents: bytes_of(&points),
+                usage: BufferUsages::VERTEX,
+            });
+
+        let _ = RECT_INDEX_BUFFER.get_or_init(|| {
+            let indecies: [u16; 6] = [0, 1, 2, 2, 3, 0];
+            render_context
+                .device
+                .create_buffer_init(&BufferInitDescriptor {
+                    label: None,
+                    contents: bytes_of(&indecies),
+                    usage: BufferUsages::INDEX,
+                })
+        });
+
+        Rect {
+            x,
+            y,
+            width,
+            height,
+            vertex_buffer,
+        }
+    }
+    pub fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        pass.set_index_buffer(
+            RECT_INDEX_BUFFER
+                .get()
+                .expect("at least one rect should have been constructed before one gets rendered")
+                .slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw_indexed(0..RECT_INDEX_COUNT, 0, 0..1);
     }
 }

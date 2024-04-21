@@ -1,10 +1,14 @@
+mod math;
 mod widgets;
 
+use cgmath::SquareMatrix;
+use log::debug;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use wgpu::util::RenderEncoder;
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{self, ElementState, Event, KeyEvent, MouseButton, WindowEvent},
     event_loop::EventLoop,
     keyboard::{Key, NamedKey::*},
     window::{Window, WindowBuilder},
@@ -24,7 +28,11 @@ pub fn run() {
     let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    let mut state = smol::block_on(RenderContext::new(&window));
+    let mut render_context = smol::block_on(RenderContext::new(&window));
+
+    let mut rects: Vec<widgets::Rect> = Vec::new();
+    rects.push(widgets::Rect::new(0.0, 0.0, 1.0, 1.0, &mut render_context));
+    let mut cursor_location: Option<PhysicalPosition<f64>> = None;
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -43,6 +51,7 @@ pub fn run() {
             .expect("Couldn't append canvas to document body.");
     }
 
+    debug!("Debug logging enabled");
     event_loop
         .run(|event, window_target| match event {
             //Event::Resumed => window.request_redraw(),
@@ -50,9 +59,28 @@ pub fn run() {
                 ref event,
                 window_id,
             } if window_id == window.id() => match event {
-                WindowEvent::RedrawRequested => match state.render() {
+                WindowEvent::CursorLeft { .. } => cursor_location = None,
+                WindowEvent::CursorMoved { position, .. } => cursor_location = Some(*position),
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } if cursor_location.is_some() => {
+                    rects.push(widgets::Rect::new(
+                        cursor_location.unwrap().x as f32,
+                        cursor_location.unwrap().y as f32,
+                        20.0,
+                        20.0,
+                        &mut render_context,
+                    ));
+                    window.request_redraw();
+                    debug!("touch generated")
+                }
+                WindowEvent::RedrawRequested => match render_context.render(&rects) {
                     Ok(_) => (),
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::Lost) => {
+                        render_context.resize(render_context.window_size)
+                    }
                     Err(wgpu::SurfaceError::OutOfMemory) => window_target.exit(),
                     Err(e) => eprintln!("{:?}", e),
                 },
@@ -66,7 +94,7 @@ pub fn run() {
                         },
                     ..
                 } => window_target.exit(),
-                WindowEvent::Resized(new_size) => state.resize(*new_size),
+                WindowEvent::Resized(new_size) => render_context.resize(*new_size),
                 _ => {}
             },
             _ => {}
@@ -80,52 +108,16 @@ struct RenderContext<'w> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
+    window_size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 }
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
-impl Vertex {
-
-        const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-
-    const fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Vertex::ATTRIBUTES,
-        }
-    }
-}
-
-const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [0.5, -0.5, 0.0],
-        color: [0.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [-0.5, -0.5, 0.0],
-        color: [0.0, 1.0, 0.0],
-    },
-    Vertex {
-        position: [0.0, 0.5, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-];
 
 impl<'window> RenderContext<'window> {
     async fn new(window: &'window Window) -> Self {
         use wgpu::util::DeviceExt;
-        let size = window.inner_size();
+        let window_size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -172,8 +164,8 @@ impl<'window> RenderContext<'window> {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width,
-            height: size.height,
+            width: window_size.width,
+            height: window_size.height,
             present_mode: surface_caps.present_modes[0],
             desired_maximum_frame_latency: 2,
             alpha_mode: surface_caps.alpha_modes[0],
@@ -182,20 +174,44 @@ impl<'window> RenderContext<'window> {
 
         surface.configure(&device, &config);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vertex buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        let camera_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[math::WindowToWgpuMatrix::new(
+                window_size.to_logical(window.scale_factor()),
+            )]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let vertex_count = VERTICES.len().try_into().expect("vertex count should be less than u32::MAX");
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("camera_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera_bind_group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_uniform_buffer.as_entire_binding(),
+            }],
+        });
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render pipeline layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -205,9 +221,7 @@ impl<'window> RenderContext<'window> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[
-                    Vertex::desc()
-                ],
+                buffers: &[math::Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -222,7 +236,8 @@ impl<'window> RenderContext<'window> {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
+                // cull_mode: Some(wgpu::Face::Back),
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -242,10 +257,10 @@ impl<'window> RenderContext<'window> {
             device,
             queue,
             config,
-            size,
+            window_size,
             render_pipeline,
-            vertex_buffer,
-            vertex_count,
+            camera_uniform_buffer,
+            camera_bind_group,
         }
     }
 
@@ -255,7 +270,7 @@ impl<'window> RenderContext<'window> {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
+            self.window_size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
@@ -270,7 +285,7 @@ impl<'window> RenderContext<'window> {
         todo!()
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self, rects: &Vec<widgets::Rect>) -> Result<(), wgpu::SurfaceError> {
         use wgpu::{
             CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
             RenderPassDescriptor, StoreOp, TextureViewDescriptor,
@@ -307,9 +322,12 @@ impl<'window> RenderContext<'window> {
                 timestamp_writes: None,
             });
 
+            debug!("rendering {} rectangles", rects.len());
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..self.vertex_count, 0..1)
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for rect in rects {
+                rect.render(&mut render_pass);
+            }
         }
 
         self.queue.submit([encoder.finish()]);
