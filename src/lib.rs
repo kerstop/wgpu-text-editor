@@ -1,14 +1,12 @@
 mod math;
 mod widgets;
 
-use cgmath::SquareMatrix;
 use log::debug;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-use wgpu::util::RenderEncoder;
 use winit::{
-    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{self, ElementState, Event, KeyEvent, MouseButton, WindowEvent},
+    dpi::PhysicalPosition,
+    event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent},
     event_loop::EventLoop,
     keyboard::{Key, NamedKey::*},
     window::{Window, WindowBuilder},
@@ -27,11 +25,18 @@ pub fn run() {
 
     let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
+    debug!("dpi scale is {}", window.scale_factor());
 
     let mut render_context = smol::block_on(RenderContext::new(&window));
 
     let mut rects: Vec<widgets::Rect> = Vec::new();
-    rects.push(widgets::Rect::new(0.0, 0.0, 1.0, 1.0, &mut render_context));
+    rects.push(widgets::Rect::new(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        &mut render_context,
+    ));
     let mut cursor_location: Option<PhysicalPosition<f64>> = None;
 
     #[cfg(target_arch = "wasm32")]
@@ -51,7 +56,6 @@ pub fn run() {
             .expect("Couldn't append canvas to document body.");
     }
 
-    debug!("Debug logging enabled");
     event_loop
         .run(|event, window_target| match event {
             //Event::Resumed => window.request_redraw(),
@@ -66,6 +70,7 @@ pub fn run() {
                     button: MouseButton::Left,
                     ..
                 } if cursor_location.is_some() => {
+                    debug!("painting square at {:?}", cursor_location);
                     rects.push(widgets::Rect::new(
                         cursor_location.unwrap().x as f32,
                         cursor_location.unwrap().y as f32,
@@ -74,7 +79,6 @@ pub fn run() {
                         &mut render_context,
                     ));
                     window.request_redraw();
-                    debug!("touch generated")
                 }
                 WindowEvent::RedrawRequested => match render_context.render(&rects) {
                     Ok(_) => (),
@@ -102,6 +106,25 @@ pub fn run() {
         .expect("The event loop should exit gracefully");
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GlobalUniform {
+    screen_to_device_transform: [[f32; 4]; 4],
+    screen_size: [f32; 4],
+}
+
+impl GlobalUniform {
+    fn new(window: &Window) -> Self {
+        let screen_to_device_transform = math::window_to_wgpu_transform(&window).into();
+        let logical_size = window.inner_size().to_logical(window.scale_factor());
+
+        Self {
+            screen_to_device_transform,
+            screen_size: [logical_size.width, logical_size.height, 0.0, 0.0],
+        }
+    }
+}
+
 struct RenderContext<'w> {
     window: &'w Window,
     surface: wgpu::Surface<'w>,
@@ -110,8 +133,8 @@ struct RenderContext<'w> {
     config: wgpu::SurfaceConfiguration,
     window_size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    camera_uniform_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    global_uniform_buffer: wgpu::Buffer,
+    global_bind_group: wgpu::BindGroup,
 }
 
 impl<'window> RenderContext<'window> {
@@ -176,20 +199,18 @@ impl<'window> RenderContext<'window> {
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        let camera_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let global_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[math::WindowToWgpuMatrix::new(
-                window_size.to_logical(window.scale_factor()),
-            )]),
+            contents: bytemuck::cast_slice(&[GlobalUniform::new(&window)]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_bind_group_layout =
+        let global_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("camera_bind_group_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -199,19 +220,19 @@ impl<'window> RenderContext<'window> {
                 }],
             });
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera_bind_group"),
-            layout: &camera_bind_group_layout,
+        let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("global_bind_group"),
+            layout: &global_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: camera_uniform_buffer.as_entire_binding(),
+                resource: global_uniform_buffer.as_entire_binding(),
             }],
         });
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render pipeline layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
+                bind_group_layouts: &[&global_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -259,8 +280,8 @@ impl<'window> RenderContext<'window> {
             config,
             window_size,
             render_pipeline,
-            camera_uniform_buffer,
-            camera_bind_group,
+            global_uniform_buffer,
+            global_bind_group,
         }
     }
 
@@ -296,6 +317,12 @@ impl<'window> RenderContext<'window> {
             .texture
             .create_view(&TextureViewDescriptor::default());
 
+        self.queue.write_buffer(
+            &self.global_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&GlobalUniform::new(&self.window)),
+        );
+
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -322,9 +349,8 @@ impl<'window> RenderContext<'window> {
                 timestamp_writes: None,
             });
 
-            debug!("rendering {} rectangles", rects.len());
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.global_bind_group, &[]);
             for rect in rects {
                 rect.render(&mut render_pass);
             }

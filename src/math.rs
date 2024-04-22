@@ -1,38 +1,14 @@
-use cgmath::SquareMatrix;
+use cgmath::{Array, SquareMatrix};
 use winit::dpi::LogicalSize;
+use winit::window::Window;
 
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.5,
-    0.0, 0.0, 0.0, 1.0,
-);
+pub(crate) fn window_to_wgpu_transform(window: &Window) -> cgmath::Matrix4<f32> {
+    let logical_size = window.inner_size().to_logical(window.scale_factor());
+    let w: f32 = logical_size.width;
+    let h: f32 = logical_size.height;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct WindowToWgpuMatrix {
-    pub(crate) matrix: [[f32; 4]; 4],
-}
-
-impl WindowToWgpuMatrix {
-    pub(crate) fn new(logical_size: LogicalSize<f32>) -> Self {
-        log::debug!("{:?}", logical_size);
-        let w = logical_size.width;
-        let h = logical_size.height;
-        log::debug!("{:?}", cgmath::ortho(0.0, w, h, 0.0, -1.0, 1.0));
-        // #[rustfmt::skip]
-        // let matrix = (cgmath::Matrix4::new(
-        //     w,  0.0    , 0.0, -w / 2.0,
-        //     0.0    , -h, 0.0, -h / 2.0,
-        //     0.0    ,  0.0    , 1.0, 0.0     ,
-        //     0.0    ,  0.0    , 0.0, 1.0     ,
-        // ) * OPENGL_TO_WGPU_MATRIX).into();
-
-        let matrix = cgmath::Matrix4::identity().into();
-
-        Self { matrix }
-    }
+    cgmath::Matrix4::from_nonuniform_scale(2.0 / w, -2.0 / h, 1.0)
+        * cgmath::Matrix4::from_translation(cgmath::Vector3::new(-w / 2.0, -h / 2.0, 0.0))
 }
 
 #[repr(C)]
@@ -49,6 +25,14 @@ impl Vertex {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &Vertex::ATTRIBUTES,
+        }
+    }
+}
+
+impl From<cgmath::Vector3<f32>> for Vertex {
+    fn from(value: cgmath::Vector3<f32>) -> Self {
+        Self {
+            position: value.into(),
         }
     }
 }
