@@ -1,10 +1,10 @@
-mod bind_group;
 mod math;
 mod widgets;
 
 use log::debug;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+use wgpu::*;
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent},
@@ -12,8 +12,6 @@ use winit::{
     keyboard::{Key, NamedKey::*},
     window::{Window, WindowBuilder},
 };
-
-use crate::bind_group::BindGroupInstance;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub fn run() {
@@ -85,10 +83,8 @@ pub fn run() {
                 }
                 WindowEvent::RedrawRequested => match render_context.render(&rects) {
                     Ok(_) => (),
-                    Err(wgpu::SurfaceError::Lost) => {
-                        render_context.resize(render_context.window_size)
-                    }
-                    Err(wgpu::SurfaceError::OutOfMemory) => window_target.exit(),
+                    Err(SurfaceError::Lost) => render_context.resize(render_context.window_size),
+                    Err(SurfaceError::OutOfMemory) => window_target.exit(),
                     Err(e) => eprintln!("{:?}", e),
                 },
                 WindowEvent::CloseRequested
@@ -109,32 +105,110 @@ pub fn run() {
         .expect("The event loop should exit gracefully");
 }
 
+pub struct WindowBindGroup {
+    pub bind_group: BindGroup,
+    pub bind_group_layout: BindGroupLayout,
+    pub window_to_device_transform_buffer: Buffer,
+    pub window_size_buffer: Buffer,
+}
+
+impl WindowBindGroup {
+    pub fn new(device: &Device, window: &winit::window::Window) -> Self {
+        use util::DeviceExt;
+        let transform = crate::math::window_to_wgpu_transform(window);
+        let window_to_device_transform_buffer =
+            device.create_buffer_init(&util::BufferInitDescriptor {
+                label: None,
+                contents: &bytemuck::cast_slice(AsRef::<[f32; 16]>::as_ref(&transform)),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            });
+
+        let window_size = window.inner_size().to_logical(window.scale_factor());
+        let window_size_vector: [f32; 4] = [window_size.width, window_size.height, 0.0, 0.0];
+
+        let window_size_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&window_size_vector),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(LAYOUT_DESCRIPTOR);
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("WindowBindGroup"),
+            layout: &bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: window_to_device_transform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: window_size_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            bind_group,
+            bind_group_layout,
+            window_to_device_transform_buffer,
+            window_size_buffer,
+        }
+    }
+}
+
+const LAYOUT_DESCRIPTOR: &'static BindGroupLayoutDescriptor<'static> = &BindGroupLayoutDescriptor {
+    label: Some("WindowBindGroup"),
+    entries: &[
+        BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX_FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        BindGroupLayoutEntry {
+            binding: 1,
+            visibility: ShaderStages::VERTEX_FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ],
+};
+
 struct RenderContext<'w> {
     window: &'w Window,
-    surface: wgpu::Surface<'w>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    surface: Surface<'w>,
+    device: Device,
+    queue: Queue,
+    config: SurfaceConfiguration,
     window_size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline,
-    window_bind_group: bind_group::WindowBindGroup,
+    render_pipeline: RenderPipeline,
+    window_bind_group: WindowBindGroup,
 }
 
 impl<'window> RenderContext<'window> {
     async fn new(window: &'window Window) -> Self {
-        use wgpu::util::DeviceExt;
         let window_size = window.inner_size();
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::all(),
             ..Default::default()
         });
 
         let surface = instance.create_surface(window).unwrap();
 
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptionsBase {
-                power_preference: wgpu::PowerPreference::default(),
+            .request_adapter(&RequestAdapterOptionsBase {
+                power_preference: PowerPreference::default(),
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
             })
@@ -143,13 +217,13 @@ impl<'window> RenderContext<'window> {
 
         let (device, queue) = adapter
             .request_device(
-                &wgpu::DeviceDescriptor {
+                &DeviceDescriptor {
                     label: None,
-                    required_features: wgpu::Features::empty(),
+                    required_features: Features::empty(),
                     required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
+                        Limits::downlevel_webgl2_defaults()
                     } else {
-                        wgpu::Limits::default()
+                        Limits::default()
                     },
                 },
                 None,
@@ -167,8 +241,8 @@ impl<'window> RenderContext<'window> {
             .next()
             .unwrap_or(surface_caps.formats[0]);
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: window_size.width,
             height: window_size.height,
@@ -180,45 +254,44 @@ impl<'window> RenderContext<'window> {
 
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
 
-        let window_bind_group = bind_group::WindowBindGroup::new(&device, window);
+        let window_bind_group = WindowBindGroup::new(&device, window);
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render pipeline layout"),
-                bind_group_layouts: &[&window_bind_group.bind_group_layout],
-                push_constant_ranges: &[],
-            });
+        let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Render pipeline layout"),
+            bind_group_layouts: &[&window_bind_group.bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("Render pipeline"),
             layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
+            vertex: VertexState {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[math::Vertex::desc()],
             },
-            fragment: Some(wgpu::FragmentState {
+            fragment: Some(FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
+                targets: &[Some(ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Back),
+                front_face: FrontFace::Cw,
+                cull_mode: Some(Face::Back),
                 unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
+                polygon_mode: PolygonMode::Fill,
                 conservative: false,
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState {
+            multisample: MultisampleState {
                 count: 1,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
@@ -247,20 +320,7 @@ impl<'window> RenderContext<'window> {
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        false
-    }
-
-    fn update(&mut self) {
-        todo!()
-    }
-
-    fn render(&mut self, rects: &Vec<widgets::Rect>) -> Result<(), wgpu::SurfaceError> {
-        use wgpu::{
-            CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
-            RenderPassDescriptor, StoreOp, TextureViewDescriptor,
-        };
-
+    fn render(&mut self, rects: &Vec<widgets::Rect>) -> Result<(), SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -298,7 +358,7 @@ impl<'window> RenderContext<'window> {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
+                        load: LoadOp::Clear(Color {
                             r: 0.1,
                             g: 0.2,
                             b: 0.3,
@@ -313,7 +373,7 @@ impl<'window> RenderContext<'window> {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            self.window_bind_group.bind(0, &mut render_pass);
+            render_pass.set_bind_group(0, &self.window_bind_group.bind_group, &[]);
             for rect in rects {
                 rect.render(&mut render_pass);
             }
