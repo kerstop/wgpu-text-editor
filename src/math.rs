@@ -28,11 +28,3 @@ impl Vertex {
         }
     }
 }
-
-impl From<cgmath::Vector3<f32>> for Vertex {
-    fn from(value: cgmath::Vector3<f32>) -> Self {
-        Self {
-            position: value.into(),
-        }
-    }
-}

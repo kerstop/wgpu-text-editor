@@ -1,3 +1,4 @@
+mod bind_group;
 mod math;
 mod widgets;
 
@@ -11,6 +12,8 @@ use winit::{
     keyboard::{Key, NamedKey::*},
     window::{Window, WindowBuilder},
 };
+
+use crate::bind_group::BindGroupInstance;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub fn run() {
@@ -106,25 +109,6 @@ pub fn run() {
         .expect("The event loop should exit gracefully");
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct GlobalUniform {
-    screen_to_device_transform: [[f32; 4]; 4],
-    screen_size: [f32; 4],
-}
-
-impl GlobalUniform {
-    fn new(window: &Window) -> Self {
-        let screen_to_device_transform = math::window_to_wgpu_transform(&window).into();
-        let logical_size = window.inner_size().to_logical(window.scale_factor());
-
-        Self {
-            screen_to_device_transform,
-            screen_size: [logical_size.width, logical_size.height, 0.0, 0.0],
-        }
-    }
-}
-
 struct RenderContext<'w> {
     window: &'w Window,
     surface: wgpu::Surface<'w>,
@@ -133,8 +117,7 @@ struct RenderContext<'w> {
     config: wgpu::SurfaceConfiguration,
     window_size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    global_uniform_buffer: wgpu::Buffer,
-    global_bind_group: wgpu::BindGroup,
+    window_bind_group: bind_group::WindowBindGroup,
 }
 
 impl<'window> RenderContext<'window> {
@@ -199,40 +182,12 @@ impl<'window> RenderContext<'window> {
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        let global_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[GlobalUniform::new(&window)]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let global_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-
-        let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("global_bind_group"),
-            layout: &global_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: global_uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let window_bind_group = bind_group::WindowBindGroup::new(&device, window);
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render pipeline layout"),
-                bind_group_layouts: &[&global_bind_group_layout],
+                bind_group_layouts: &[&window_bind_group.bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -279,13 +234,8 @@ impl<'window> RenderContext<'window> {
             config,
             window_size,
             render_pipeline,
-            global_uniform_buffer,
-            global_bind_group,
+            window_bind_group,
         }
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -316,10 +266,24 @@ impl<'window> RenderContext<'window> {
             .texture
             .create_view(&TextureViewDescriptor::default());
 
+        let transform = math::window_to_wgpu_transform(self.window);
+
         self.queue.write_buffer(
-            &self.global_uniform_buffer,
+            &self.window_bind_group.window_to_device_transform_buffer,
             0,
-            bytemuck::bytes_of(&GlobalUniform::new(&self.window)),
+            bytemuck::cast_slice(AsRef::<[f32; 16]>::as_ref(&transform)),
+        );
+
+        let window_size = self
+            .window
+            .inner_size()
+            .to_logical(self.window.scale_factor());
+        let window_size_vector: [f32; 4] = [window_size.width, window_size.height, 0.0, 0.0];
+
+        self.queue.write_buffer(
+            &self.window_bind_group.window_size_buffer,
+            0,
+            bytemuck::cast_slice(&window_size_vector),
         );
 
         let mut encoder = self
@@ -349,7 +313,7 @@ impl<'window> RenderContext<'window> {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.global_bind_group, &[]);
+            self.window_bind_group.bind(0, &mut render_pass);
             for rect in rects {
                 rect.render(&mut render_pass);
             }
