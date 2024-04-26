@@ -10,10 +10,10 @@ const RECT_INDEX_COUNT: u32 = 6;
 static RECT_INDEX_BUFFER: OnceLock<Buffer> = OnceLock::new();
 
 pub struct Rect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
     vertex_buffer: Buffer,
 }
 

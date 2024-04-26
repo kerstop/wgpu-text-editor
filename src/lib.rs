@@ -5,6 +5,7 @@ use log::debug;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use wgpu::*;
+use wgpu_text::glyph_brush::{self, ab_glyph};
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent},
@@ -189,8 +190,9 @@ struct RenderContext<'w> {
     surface: Surface<'w>,
     device: Device,
     queue: Queue,
-    config: SurfaceConfiguration,
+    surface_config: SurfaceConfiguration,
     window_size: winit::dpi::PhysicalSize<u32>,
+    text_brush: wgpu_text::TextBrush,
     render_pipeline: RenderPipeline,
     window_bind_group: WindowBindGroup,
 }
@@ -241,7 +243,7 @@ impl<'window> RenderContext<'window> {
             .next()
             .unwrap_or(surface_caps.formats[0]);
 
-        let config = SurfaceConfiguration {
+        let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: window_size.width,
@@ -252,7 +254,17 @@ impl<'window> RenderContext<'window> {
             view_formats: vec![],
         };
 
-        surface.configure(&device, &config);
+        surface.configure(&device, &surface_config);
+
+        let font = ab_glyph::FontArc::new(
+            ab_glyph::FontRef::try_from_slice(include_bytes!("fonts/Roboto-Regular.ttf")).unwrap(),
+        );
+        let text_brush = wgpu_text::BrushBuilder::using_font(font).build(
+            &device,
+            window_size.width,
+            window_size.height,
+            surface_config.format,
+        );
 
         let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
 
@@ -276,7 +288,7 @@ impl<'window> RenderContext<'window> {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[Some(ColorTargetState {
-                    format: config.format,
+                    format: surface_config.format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -304,8 +316,9 @@ impl<'window> RenderContext<'window> {
             surface,
             device,
             queue,
-            config,
+            surface_config,
             window_size,
+            text_brush,
             render_pipeline,
             window_bind_group,
         }
@@ -314,9 +327,11 @@ impl<'window> RenderContext<'window> {
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.window_size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            self.surface_config.width = new_size.width;
+            self.surface_config.height = new_size.height;
+            self.surface.configure(&self.device, &self.surface_config);
+            self.text_brush
+                .resize_view(new_size.width as f32, new_size.height as f32, &self.queue);
         }
     }
 
@@ -345,6 +360,18 @@ impl<'window> RenderContext<'window> {
             0,
             bytemuck::cast_slice(&window_size_vector),
         );
+
+        let mut sections = Vec::new();
+
+        for rect in rects {
+            sections.push(
+                glyph_brush::Section::default()
+                    .add_text(glyph_brush::Text::new("(;-;)"))
+                    .with_screen_position((rect.x, rect.y))
+                    .with_bounds((rect.width, rect.height)),
+            );
+        }
+        self.text_brush.queue(&self.device, &self.queue, sections);
 
         let mut encoder = self
             .device
@@ -377,6 +404,7 @@ impl<'window> RenderContext<'window> {
             for rect in rects {
                 rect.render(&mut render_pass);
             }
+            self.text_brush.draw(&mut render_pass);
         }
 
         self.queue.submit([encoder.finish()]);
