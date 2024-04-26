@@ -9,6 +9,32 @@ const RECT_VERTEX_COUNT: u32 = 4;
 const RECT_INDEX_COUNT: u32 = 6;
 static RECT_INDEX_BUFFER: OnceLock<Buffer> = OnceLock::new();
 
+#[non_exhaustive]
+pub enum Event {
+    MouseEnter,
+    MouseExit,
+    Clicked,
+}
+
+pub trait Widget {
+    fn bounds(&self) -> Bounds;
+    fn process_event(&mut self, event: &Event);
+    fn render<'a>(&'a self, pass: &mut RenderPass<'a>);
+}
+
+pub struct Bounds {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+}
+
+impl Bounds {
+    fn is_inside(&self, (x, y): (f32, f32)) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
+}
+
 pub struct Rect {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -68,7 +94,25 @@ impl Rect {
             vertex_buffer,
         }
     }
-    pub fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
+}
+
+impl Widget for Rect {
+    fn bounds(&self) -> Bounds {
+        Bounds {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn process_event(&mut self, event: &Event) {
+        match event {
+            _ => (),
+        }
+    }
+
+    fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
         pass.set_index_buffer(
             RECT_INDEX_BUFFER
                 .get()

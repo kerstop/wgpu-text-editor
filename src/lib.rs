@@ -31,15 +31,18 @@ pub fn run() {
 
     let mut render_context = smol::block_on(RenderContext::new(&window));
 
-    let mut rects: Vec<widgets::Rect> = Vec::new();
-    rects.push(widgets::Rect::new(
-        0.0,
-        0.0,
-        10.0,
-        10.0,
+    let mut cursor_location: Option<PhysicalPosition<f64>> = None;
+
+    let mut logical_window_size: winit::dpi::LogicalSize<f32> =
+        window.inner_size().to_logical(window.scale_factor());
+
+    let mut root_widget: Box<dyn widgets::Widget> = Box::new(widgets::Rect::new(
+        logical_window_size.width / 2.0 - 300.0 / 2.0,
+        logical_window_size.height / 2.0 - 200.0 / 2.0,
+        300.0,
+        200.0,
         &mut render_context,
     ));
-    let mut cursor_location: Option<PhysicalPosition<f64>> = None;
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -60,7 +63,7 @@ pub fn run() {
 
     event_loop
         .run(|event, window_target| match event {
-            //Event::Resumed => window.request_redraw(),
+            Event::Resumed => window.request_redraw(),
             Event::WindowEvent {
                 ref event,
                 window_id,
@@ -72,17 +75,9 @@ pub fn run() {
                     button: MouseButton::Left,
                     ..
                 } if cursor_location.is_some() => {
-                    debug!("painting square at {:?}", cursor_location);
-                    rects.push(widgets::Rect::new(
-                        cursor_location.unwrap().x as f32,
-                        cursor_location.unwrap().y as f32,
-                        20.0,
-                        20.0,
-                        &mut render_context,
-                    ));
-                    window.request_redraw();
+                    debug!("Click detected at {:?}", cursor_location);
                 }
-                WindowEvent::RedrawRequested => match render_context.render(&rects) {
+                WindowEvent::RedrawRequested => match render_context.render(&*root_widget) {
                     Ok(_) => (),
                     Err(SurfaceError::Lost) => render_context.resize(render_context.window_size),
                     Err(SurfaceError::OutOfMemory) => window_target.exit(),
@@ -98,7 +93,10 @@ pub fn run() {
                         },
                     ..
                 } => window_target.exit(),
-                WindowEvent::Resized(new_size) => render_context.resize(*new_size),
+                WindowEvent::Resized(new_size) => {
+                    logical_window_size = new_size.to_logical(window.scale_factor());
+                    render_context.resize(*new_size)
+                }
                 _ => {}
             },
             _ => {}
@@ -335,7 +333,7 @@ impl<'window> RenderContext<'window> {
         }
     }
 
-    fn render(&mut self, rects: &Vec<widgets::Rect>) -> Result<(), SurfaceError> {
+    fn render(&mut self, root_widget: &dyn widgets::Widget) -> Result<(), SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -363,15 +361,18 @@ impl<'window> RenderContext<'window> {
 
         let mut sections = Vec::new();
 
-        for rect in rects {
-            sections.push(
-                glyph_brush::Section::default()
-                    .add_text(glyph_brush::Text::new("(;-;)"))
-                    .with_screen_position((rect.x, rect.y))
-                    .with_bounds((rect.width, rect.height)),
-            );
-        }
-        self.text_brush.queue(&self.device, &self.queue, sections);
+        let root_widget_bounds = root_widget.bounds();
+
+        sections.push(
+            glyph_brush::Section::default()
+                .add_text(glyph_brush::Text::new("(;-;)"))
+                .with_screen_position((root_widget_bounds.x, root_widget_bounds.y))
+                .with_bounds((root_widget_bounds.width, root_widget_bounds.height)),
+        );
+
+        self.text_brush
+            .queue(&self.device, &self.queue, sections)
+            .unwrap();
 
         let mut encoder = self
             .device
@@ -401,9 +402,9 @@ impl<'window> RenderContext<'window> {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.window_bind_group.bind_group, &[]);
-            for rect in rects {
-                rect.render(&mut render_pass);
-            }
+
+            root_widget.render(&mut render_pass);
+
             self.text_brush.draw(&mut render_pass);
         }
 
